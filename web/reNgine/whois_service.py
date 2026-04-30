@@ -17,6 +17,7 @@ class WhoisResult:
     data: dict
     raw_keys: list
     used_fallback: bool = False
+    provider_attempts: list = None
 
     def to_dict(self):
         return asdict(self)
@@ -129,16 +130,32 @@ class WhoisService:
         self.rdap_provider = rdap_provider or RdapWhoisProvider()
 
     def query(self, target):
+        attempts = []
         netlas_result = self.netlas_provider.query(target)
+        attempts.append({
+            "provider": netlas_result.provider,
+            "status": netlas_result.status,
+            "category": netlas_result.category,
+            "message": netlas_result.message,
+        })
         if netlas_result.status == "ok":
+            netlas_result.provider_attempts = attempts
             return netlas_result
 
         if netlas_result.category in {"config_error", "auth_error", "rate_limit", "timeout", "no_data", "temporary_error", "parser_error"}:
             rdap_result = self.rdap_provider.query(target)
             rdap_result.used_fallback = True
+            attempts.append({
+                "provider": rdap_result.provider,
+                "status": rdap_result.status,
+                "category": rdap_result.category,
+                "message": rdap_result.message,
+            })
             if rdap_result.status == "ok":
+                rdap_result.provider_attempts = attempts
                 return rdap_result
-            return WhoisResult("failed", rdap_result.provider, rdap_result.category, rdap_result.message, {}, rdap_result.raw_keys, True)
+            return WhoisResult("failed", "none", rdap_result.category, rdap_result.message, {}, rdap_result.raw_keys, True, attempts)
+        netlas_result.provider_attempts = attempts
         return netlas_result
 
 

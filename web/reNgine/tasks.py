@@ -3824,12 +3824,11 @@ def query_whois(target, force_reload_whois=False):
 		whois_result = None
 		related_domains = []
 
-		with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+		with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
 			futures_func = {
 				executor.submit(get_domain_historical_ip_address, target): 'historical_ips',
 				executor.submit(fetch_related_tlds_and_domains, target): 'related_tlds_and_domains',
 				executor.submit(reverse_whois, target): 'reverse_whois',
-				executor.submit(WhoisService().query, target): 'whois_data',
 			}
 
 			for future in concurrent.futures.as_completed(futures_func):
@@ -3842,9 +3841,6 @@ def query_whois(target, force_reload_whois=False):
 						domain_info.related_tlds, tlsx_related_domain = result
 					elif func_name == 'reverse_whois':
 						related_domains = result
-					elif func_name == 'whois_data':
-						whois_result = result
-
 					logger.debug('*'*100)
 					logger.info(f'Task {func_name} finished for target {target}')
 					logger.debug(result)
@@ -3855,6 +3851,7 @@ def query_whois(target, force_reload_whois=False):
 					continue
 
 		logger.info(f'All concurrent whosi lookup tasks finished for target {target}')
+		whois_result = WhoisService().query(target)
 
 		if 'tlsx_related_domain' in locals():
 			related_domains += tlsx_related_domain
@@ -3863,11 +3860,12 @@ def query_whois(target, force_reload_whois=False):
 			'status': whois_result is not None and whois_result.status == 'ok',
 			'category': whois_result.category if whois_result else 'empty_response',
 			'message': whois_result.message if whois_result else 'WHOIS response was empty.',
-			'provider': whois_result.provider if whois_result else 'unknown',
+			'provider': whois_result.provider if whois_result else 'none',
 			'used_fallback': bool(whois_result and whois_result.used_fallback),
+			'provider_attempts': whois_result.provider_attempts if whois_result and whois_result.provider_attempts else [],
 		}
 		whois_data = whois_result.data if whois_result and whois_result.status == 'ok' else {}
-		logger.info(f"whois_provider_used={whois_status['provider']} whois_status={whois_result.status if whois_result else 'failed'} whois_category={whois_status['category']} whois_data_received={bool(whois_data)}")
+		logger.info(f"whois_provider_used={whois_status['provider']} whois_status={whois_result.status if whois_result else 'failed'} whois_category={whois_status['category']} whois_data_received={bool(whois_data)} provider_attempts={whois_status['provider_attempts']}")
 
 		# related domains can also be fetched from whois_data
 		whois_related_domains = whois_data.get('related_domains', [])
@@ -3878,12 +3876,22 @@ def query_whois(target, force_reload_whois=False):
 		domain_info.related_domains = related_domains
 
 
-		parse_whois_data(domain_info, whois_data)
-		domain_info.whois_status = whois_status
-		saved_domain_info = save_domain_info_to_db(target, domain_info)
+		if whois_data:
+			parse_whois_data(domain_info, whois_data)
+			domain_info.whois_status = whois_status
+			saved_domain_info = save_domain_info_to_db(target, domain_info)
+		else:
+			existing_domain_info = get_domain_info_from_db(target)
+			if existing_domain_info:
+				existing_domain_info.whois_status = whois_status
+				saved_domain_info = save_domain_info_to_db(target, existing_domain_info)
+				domain_info = existing_domain_info
+			else:
+				domain_info.whois_status = whois_status
+				saved_domain_info = save_domain_info_to_db(target, domain_info)
 		response = format_whois_response(domain_info)
 		response['whois_status'] = whois_status
-		logger.info(f"whois_data_saved={bool(saved_domain_info)} whois_db_object_id={getattr(saved_domain_info, 'id', None)}")
+		logger.info(f"whois_data_saved={bool(saved_domain_info and bool(whois_data))} whois_diagnostic_saved={bool(saved_domain_info and not bool(whois_data))} whois_db_object_id={getattr(saved_domain_info, 'id', None)}")
 		return response
 	except Exception as e:
 		logger.error(f'An error occurred while querying WHOIS information for {target}: {str(e)}')
@@ -4156,7 +4164,10 @@ def run_command(
 		tuple: Tuple with return_code, output.
 	"""
 	logger.info(cmd)
-	logger.warning(activity_id)
+	if activity_id is None:
+		logger.debug('run_command invoked without activity_id')
+	else:
+		logger.info(f'run_command activity_id={activity_id}')
 
 	# Create a command record in the database
 	command_obj = Command.objects.create(
