@@ -33,6 +33,7 @@ from reNgine.definitions import *
 from reNgine.settings import *
 from reNgine.llm import *
 from reNgine.utilities import *
+from reNgine.whois_service import WhoisService, acquire_whois_lock, release_whois_lock
 from scanEngine.models import (EngineType, InstalledExternalTool, Notification, Proxy)
 from startScan.models import *
 from startScan.models import EndPoint, Subdomain, Vulnerability
@@ -79,6 +80,9 @@ def initiate_scan(
 	"""
 	logger.info('Initiating scan on celery')
 	scan = None
+	if not acquire_whois_lock(target):
+		logger.info(f'WHOIS lock is active for {target}, skipping duplicate request')
+		return {'status': False, 'target': target, 'result': 'WHOIS query already in progress.'}
 	try:
 		# Get scan engine
 		engine_id = engine_id or scan.scan_type.id # scan history engine_id
@@ -3817,7 +3821,7 @@ def query_whois(target, force_reload_whois=False):
 		domain_info = DottedDict()
 		domain_info.target = target
 
-		whois_data = {'status': False, 'message': 'WHOIS data not fetched yet.'}
+		whois_result = None
 		related_domains = []
 
 		with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -3825,7 +3829,7 @@ def query_whois(target, force_reload_whois=False):
 				executor.submit(get_domain_historical_ip_address, target): 'historical_ips',
 				executor.submit(fetch_related_tlds_and_domains, target): 'related_tlds_and_domains',
 				executor.submit(reverse_whois, target): 'reverse_whois',
-				executor.submit(fetch_whois_data_using_netlas, target): 'whois_data',
+				executor.submit(WhoisService().query, target): 'whois_data',
 			}
 
 			for future in concurrent.futures.as_completed(futures_func):
@@ -3839,7 +3843,7 @@ def query_whois(target, force_reload_whois=False):
 					elif func_name == 'reverse_whois':
 						related_domains = result
 					elif func_name == 'whois_data':
-						whois_data = result
+						whois_result = result
 
 					logger.debug('*'*100)
 					logger.info(f'Task {func_name} finished for target {target}')
@@ -3855,23 +3859,15 @@ def query_whois(target, force_reload_whois=False):
 		if 'tlsx_related_domain' in locals():
 			related_domains += tlsx_related_domain
 		
-		whois_status = classify_whois_status(whois_data, target)
-		if not whois_status.get('status'):
-			logger.warning(f'WHOIS query degraded for {target}: {whois_status}')
-			rdap_data = fetch_rdap_data(target)
-			if rdap_data.get('status'):
-				logger.info(f'RDAP fallback succeeded for {target}')
-				whois_data = rdap_data.get('data', {})
-				whois_status = {
-					'status': True,
-					'category': 'rdap_fallback',
-					'message': 'WHOIS unavailable; RDAP fallback used.',
-				}
-			else:
-				logger.warning(f'RDAP fallback failed for {target}: {rdap_data.get("message")}')
-				whois_data = {}
-		else:
-			whois_data = whois_data.get('data', {})
+		whois_status = {
+			'status': whois_result is not None and whois_result.status == 'ok',
+			'category': whois_result.category if whois_result else 'empty_response',
+			'message': whois_result.message if whois_result else 'WHOIS response was empty.',
+			'provider': whois_result.provider if whois_result else 'unknown',
+			'used_fallback': bool(whois_result and whois_result.used_fallback),
+		}
+		whois_data = whois_result.data if whois_result and whois_result.status == 'ok' else {}
+		logger.info(f"whois_provider_used={whois_status['provider']} whois_status={whois_result.status if whois_result else 'failed'} whois_category={whois_status['category']} whois_data_received={bool(whois_data)}")
 
 		# related domains can also be fetched from whois_data
 		whois_related_domains = whois_data.get('related_domains', [])
@@ -3887,6 +3883,7 @@ def query_whois(target, force_reload_whois=False):
 		saved_domain_info = save_domain_info_to_db(target, domain_info)
 		response = format_whois_response(domain_info)
 		response['whois_status'] = whois_status
+		logger.info(f"whois_data_saved={bool(saved_domain_info)} whois_db_object_id={getattr(saved_domain_info, 'id', None)}")
 		return response
 	except Exception as e:
 		logger.error(f'An error occurred while querying WHOIS information for {target}: {str(e)}')
@@ -3895,6 +3892,8 @@ def query_whois(target, force_reload_whois=False):
 			'target': target, 
 			'result': f'An error occurred while querying WHOIS information for {target}: {str(e)}'
 		}
+	finally:
+		release_whois_lock(target)
 
 def classify_whois_status(whois_response, target):
 	"""Classify WHOIS provider responses into actionable categories."""
