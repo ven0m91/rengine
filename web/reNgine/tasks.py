@@ -10,6 +10,8 @@ import yaml
 import tldextract
 import concurrent.futures
 import base64
+import shutil
+import requests
 
 from datetime import datetime
 from urllib.parse import urlparse
@@ -3815,7 +3817,7 @@ def query_whois(target, force_reload_whois=False):
 		domain_info = DottedDict()
 		domain_info.target = target
 
-		whois_data = None
+		whois_data = {'status': False, 'message': 'WHOIS data not fetched yet.'}
 		related_domains = []
 
 		with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -3853,7 +3855,23 @@ def query_whois(target, force_reload_whois=False):
 		if 'tlsx_related_domain' in locals():
 			related_domains += tlsx_related_domain
 		
-		whois_data = whois_data.get('data', {})
+		whois_status = classify_whois_status(whois_data, target)
+		if not whois_status.get('status'):
+			logger.warning(f'WHOIS query degraded for {target}: {whois_status}')
+			rdap_data = fetch_rdap_data(target)
+			if rdap_data.get('status'):
+				logger.info(f'RDAP fallback succeeded for {target}')
+				whois_data = rdap_data.get('data', {})
+				whois_status = {
+					'status': True,
+					'category': 'rdap_fallback',
+					'message': 'WHOIS unavailable; RDAP fallback used.',
+				}
+			else:
+				logger.warning(f'RDAP fallback failed for {target}: {rdap_data.get("message")}')
+				whois_data = {}
+		else:
+			whois_data = whois_data.get('data', {})
 
 		# related domains can also be fetched from whois_data
 		whois_related_domains = whois_data.get('related_domains', [])
@@ -3865,8 +3883,11 @@ def query_whois(target, force_reload_whois=False):
 
 
 		parse_whois_data(domain_info, whois_data)
+		domain_info.whois_status = whois_status
 		saved_domain_info = save_domain_info_to_db(target, domain_info)
-		return format_whois_response(domain_info)
+		response = format_whois_response(domain_info)
+		response['whois_status'] = whois_status
+		return response
 	except Exception as e:
 		logger.error(f'An error occurred while querying WHOIS information for {target}: {str(e)}')
 		return {
@@ -3874,6 +3895,65 @@ def query_whois(target, force_reload_whois=False):
 			'target': target, 
 			'result': f'An error occurred while querying WHOIS information for {target}: {str(e)}'
 		}
+
+def classify_whois_status(whois_response, target):
+	"""Classify WHOIS provider responses into actionable categories."""
+	if not whois_response:
+		return {'status': False, 'category': 'empty_response', 'message': 'WHOIS response was empty.'}
+	if whois_response.get('status') is True and whois_response.get('data'):
+		return {'status': True, 'category': 'ok', 'message': 'WHOIS data retrieved.'}
+
+	message = (whois_response.get('message') or '').lower()
+	target_tld = f".{target.rsplit('.', 1)[-1].lower()}" if '.' in target else ''
+	if 'request limit' in message or 'limit exceeded' in message:
+		category = 'rate_limit'
+	elif 'timeout' in message:
+		category = 'timeout'
+	elif 'parse' in message:
+		category = 'parser_error'
+	elif 'api key' in message:
+		category = 'auth_error'
+	elif 'no data available' in message:
+		category = 'no_data'
+	elif target_tld == '.cl' and ('temporarily blocked' in message or 'blocked' in message):
+		category = 'blocked'
+	else:
+		category = 'temporary_error'
+
+	return {
+		'status': False,
+		'category': category,
+		'message': whois_response.get('message') or 'WHOIS lookup failed.',
+	}
+
+def fetch_rdap_data(target):
+	"""Fallback to RDAP lookup for domains when WHOIS data is unavailable."""
+	rdap_url = f'https://rdap.org/domain/{target}'
+	try:
+		response = requests.get(rdap_url, timeout=12)
+		if response.status_code == 404:
+			return {'status': False, 'message': 'Domain not found in RDAP.'}
+		response.raise_for_status()
+		data = response.json()
+		return {
+			'status': True,
+			'data': {
+				'whois': {
+					'created_date': data.get('events', [{}])[0].get('eventDate'),
+					'expiration_date': next((evt.get('eventDate') for evt in data.get('events', []) if evt.get('eventAction') == 'expiration'), None),
+					'updated_date': next((evt.get('eventDate') for evt in data.get('events', []) if evt.get('eventAction') == 'last changed'), None),
+					'status': data.get('status', []),
+				},
+				'dns': {
+					'ns': [host.get('ldhName') for host in data.get('nameservers', []) if host.get('ldhName')]
+				},
+				'related_domains': [],
+			}
+		}
+	except requests.exceptions.Timeout:
+		return {'status': False, 'message': 'RDAP request timeout.'}
+	except Exception as e:
+		return {'status': False, 'message': f'RDAP fallback failed: {e}'}
 
 
 def fetch_related_tlds_and_domains(domain):
@@ -3935,6 +4015,11 @@ def fetch_whois_data_using_netlas(target):
 		command += f' -a {netlas_key}'
 
 	try:
+		if shutil.which('netlas') is None:
+			return {
+				'status': False,
+				'message': 'Missing dependency: netlas command is not installed.'
+			}
 		_, result = run_command(command, remove_ansi_sequence=True)
 		
 		# catch errors
